@@ -37,7 +37,11 @@ export type Transformer = {
   endPoint?: string;
   name?: string;
   auth?: (request: any, provider: LLMProvider, context: TransformerContext) => Promise<any>;
-  
+
+  // When true on a provider transformer, skip all format conversions
+  // Only auth() methods will be called, request/response pass through unchanged
+  passthrough?: boolean;
+
   // Logger for transformer
   logger?: any;
 };

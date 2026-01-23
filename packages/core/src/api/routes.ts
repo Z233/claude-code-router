@@ -277,13 +277,34 @@ async function processRequestTransformers(
 
 /**
  * Determine if transformers should be bypassed (passthrough mode)
- * Skip other transformers when provider only uses one transformer and it matches the current one
+ * Skip format conversions when:
+ * 1. Any provider transformer has passthrough: true, OR
+ * 2. Provider only uses one transformer and it matches the route transformer
  */
 function shouldBypassTransformers(
   provider: any,
   transformer: any,
   body: any
 ): boolean {
+  // Check if any provider transformer has passthrough enabled
+  const providerTransformers = provider.transformer?.use || [];
+  const hasPassthroughTransformer = providerTransformers.some(
+    (t: any) => t?.passthrough === true
+  );
+  if (hasPassthroughTransformer) {
+    return true;
+  }
+
+  // Also check model-specific transformers
+  const modelTransformers = provider.transformer?.[body.model]?.use || [];
+  const hasModelPassthrough = modelTransformers.some(
+    (t: any) => t?.passthrough === true
+  );
+  if (hasModelPassthrough) {
+    return true;
+  }
+
+  // Existing logic: skip when provider only uses one transformer and it matches the route transformer
   return (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&
@@ -309,26 +330,43 @@ async function sendRequestToProvider(
   const url = config.url || new URL(provider.baseUrl);
 
   // Handle authentication in passthrough mode
-  if (bypass && typeof transformer.auth === "function") {
-    const auth = await transformer.auth(requestBody, provider);
-    if (auth.body) {
-      requestBody = auth.body;
-      let headers = config.headers || {};
-      if (auth.config?.headers) {
-        headers = {
-          ...headers,
-          ...auth.config.headers,
+  if (bypass) {
+    // Find the passthrough transformer and call its auth
+    const providerTransformers = provider.transformer?.use || [];
+    const passthroughTransformer = providerTransformers.find(
+      (t: any) => t?.passthrough === true
+    );
+
+    // Also check model-specific transformers
+    const modelTransformers = provider.transformer?.[requestBody.model]?.use || [];
+    const modelPassthroughTransformer = modelTransformers.find(
+      (t: any) => t?.passthrough === true
+    );
+
+    // Prefer model-specific passthrough transformer, then provider-level, then route transformer
+    const authTransformer = modelPassthroughTransformer || passthroughTransformer || transformer;
+
+    if (authTransformer && typeof authTransformer.auth === "function") {
+      const auth = await authTransformer.auth(requestBody, provider, context);
+      if (auth.body) {
+        requestBody = auth.body;
+        let headers = config.headers || {};
+        if (auth.config?.headers) {
+          headers = {
+            ...headers,
+            ...auth.config.headers,
+          };
+          delete headers.host;
+          delete auth.config.headers;
+        }
+        config = {
+          ...config,
+          ...auth.config,
+          headers,
         };
-        delete headers.host;
-        delete auth.config.headers;
+      } else {
+        requestBody = auth;
       }
-      config = {
-        ...config,
-        ...auth.config,
-        headers,
-      };
-    } else {
-      requestBody = auth;
     }
   }
 
