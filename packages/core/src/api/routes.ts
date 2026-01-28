@@ -12,6 +12,7 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
+import { SSEParserTransform, SSESerializerTransform } from "@/utils/sse";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -308,9 +309,9 @@ function shouldBypassTransformers(
   return (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&
-    (!provider.transformer?.[body.model]?.use.length ||
-      (provider.transformer?.[body.model]?.use.length === 1 &&
-        provider.transformer?.[body.model]?.use[0].name === transformer.name))
+    (!provider.transformer?.[body.model]?.use?.length ||
+      (provider.transformer?.[body.model]?.use?.length === 1 &&
+        provider.transformer?.[body.model]?.use?.[0].name === transformer.name))
   );
 }
 
@@ -474,6 +475,8 @@ async function processResponseTransformers(
     );
   }
 
+  finalResponse = await normalizeAnthropicUsage(finalResponse, transformer);
+
   return finalResponse;
 }
 
@@ -498,6 +501,148 @@ function formatResponse(response: any, reply: FastifyReply, body: any) {
     // Handle regular JSON response
     return response.json();
   }
+}
+
+function toInt(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return 0;
+}
+
+function normalizeUsageObject(usage: any): any {
+  if (!usage || typeof usage !== "object") return usage;
+
+  const next = { ...usage };
+
+  if (next.input_tokens == null) {
+    next.input_tokens = toInt(next.prompt_tokens);
+  }
+  if (next.output_tokens == null) {
+    next.output_tokens = toInt(next.completion_tokens);
+  }
+
+  if (next.cache_read_input_tokens == null) {
+    next.cache_read_input_tokens = toInt(next.prompt_tokens_details?.cached_tokens);
+  }
+  if (next.cache_creation_input_tokens == null) {
+    next.cache_creation_input_tokens = 0;
+  }
+
+  return next;
+}
+
+async function normalizeAnthropicUsage(
+  response: Response,
+  transformer: any
+): Promise<Response> {
+  if (!transformer || transformer.name !== "Anthropic") return response;
+
+  const contentType = response.headers.get("Content-Type") || "";
+  const isSse = contentType.includes("text/event-stream");
+  const isJson = contentType.includes("application/json");
+
+  if (isJson) {
+    const data = await response.json().catch(() => null);
+    if (!data || typeof data !== "object") return response;
+
+    if ((data as any).usage) {
+      (data as any).usage = normalizeUsageObject((data as any).usage);
+    }
+
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    headers.set("Content-Type", "application/json");
+    return new Response(JSON.stringify(data), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  if (!isSse || !response.body) return response;
+
+  let pendingMessageStop: any | null = null;
+  let lastStopDelta: { stop_reason: string; stop_sequence: any } = {
+    stop_reason: "end_turn",
+    stop_sequence: null,
+  };
+
+  const eventNormalizer = new TransformStream<any, any>({
+    transform(event, controller) {
+      const data = event?.data;
+      if (!data || typeof data !== "object") {
+        controller.enqueue(event);
+        return;
+      }
+
+      if (data.type === "message_stop") {
+        // If a provider attaches usage to message_stop, Claude Code won't see it.
+        if (data.usage) {
+          const usage = normalizeUsageObject(data.usage);
+          controller.enqueue({
+            ...event,
+            event: "message_delta",
+            data: {
+              type: "message_delta",
+              delta: lastStopDelta,
+              usage,
+            },
+          });
+          const nextStop = { ...data };
+          delete nextStop.usage;
+          pendingMessageStop = { ...event, data: nextStop };
+          return;
+        }
+
+        // Buffer message_stop until stream end so any trailing usage is emitted before it.
+        pendingMessageStop = event;
+        return;
+      }
+
+      if (data.type === "message_delta" && data.delta) {
+        lastStopDelta = {
+          stop_reason: data.delta.stop_reason ?? "end_turn",
+          stop_sequence: data.delta.stop_sequence ?? null,
+        };
+      }
+
+      if (data.type === "message_start" && data.message?.usage) {
+        data.message = { ...data.message, usage: normalizeUsageObject(data.message.usage) };
+        controller.enqueue({ ...event, data });
+        return;
+      }
+
+      if (data.usage) {
+        controller.enqueue({ ...event, data: { ...data, usage: normalizeUsageObject(data.usage) } });
+        return;
+      }
+
+      controller.enqueue(event);
+    },
+    flush(controller) {
+      if (pendingMessageStop) controller.enqueue(pendingMessageStop);
+    },
+  });
+
+  const normalizedBody = (response.body as ReadableStream<Uint8Array>)
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(new SSEParserTransform())
+    .pipeThrough(eventNormalizer)
+    .pipeThrough(new SSESerializerTransform())
+    .pipeThrough(new TextEncoderStream());
+
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.set("Content-Type", "text/event-stream");
+
+  return new Response(normalizedBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export const registerApiRoutes = async (

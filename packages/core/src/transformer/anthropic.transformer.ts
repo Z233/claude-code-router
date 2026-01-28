@@ -265,7 +265,13 @@ export class AnthropicTransformer implements Transformer {
         let model = "unknown";
         let hasStarted = false;
         let hasTextContentStarted = false;
-        let hasFinished = false;
+        let hasStopReason = false;
+        let finalStopReason: string = "end_turn";
+        let latestUsage = {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+        };
         const toolCalls = new Map<number, any>();
         const toolCallIndexToContentBlockIndex = new Map<number, number>();
         let totalChunks = 0;
@@ -402,7 +408,7 @@ export class AnthropicTransformer implements Transformer {
             buffer = lines.pop() || "";
 
             for (const line of lines) {
-              if (isClosed || hasFinished) break;
+              if (isClosed) break;
 
               if (!line.startsWith("data:")) continue;
               const data = line.slice(5).trim();
@@ -443,7 +449,7 @@ export class AnthropicTransformer implements Transformer {
 
                 model = chunk.model || model;
 
-                if (!hasStarted && !isClosed && !hasFinished) {
+                if (!hasStarted && !isClosed) {
                   hasStarted = true;
 
                   const messageStart = {
@@ -474,41 +480,32 @@ export class AnthropicTransformer implements Transformer {
 
                 const choice = chunk.choices?.[0];
                 if (chunk.usage) {
+                  latestUsage = {
+                    input_tokens:
+                      (chunk.usage?.prompt_tokens || 0) -
+                      (chunk.usage?.prompt_tokens_details?.cached_tokens || 0),
+                    output_tokens: chunk.usage?.completion_tokens || 0,
+                    cache_read_input_tokens:
+                      chunk.usage?.prompt_tokens_details?.cached_tokens || 0,
+                  };
                   if (!stopReasonMessageDelta) {
                     stopReasonMessageDelta = {
                       type: "message_delta",
                       delta: {
-                        stop_reason: "end_turn",
+                        stop_reason: finalStopReason,
                         stop_sequence: null,
                       },
-                      usage: {
-                        input_tokens:
-                          (chunk.usage?.prompt_tokens || 0) -
-                          (chunk.usage?.prompt_tokens_details?.cached_tokens ||
-                            0),
-                        output_tokens: chunk.usage?.completion_tokens || 0,
-                        cache_read_input_tokens:
-                          chunk.usage?.prompt_tokens_details?.cached_tokens ||
-                          0,
-                      },
+                      usage: latestUsage,
                     };
                   } else {
-                    stopReasonMessageDelta.usage = {
-                      input_tokens:
-                        (chunk.usage?.prompt_tokens || 0) -
-                        (chunk.usage?.prompt_tokens_details?.cached_tokens ||
-                          0),
-                      output_tokens: chunk.usage?.completion_tokens || 0,
-                      cache_read_input_tokens:
-                        chunk.usage?.prompt_tokens_details?.cached_tokens || 0,
-                    };
+                    stopReasonMessageDelta.usage = latestUsage;
                   }
                 }
                 if (!choice) {
                   continue;
                 }
 
-                if (choice?.delta?.thinking && !isClosed && !hasFinished) {
+                if (choice?.delta?.thinking && !isClosed && !hasStopReason) {
                   // Close any previous content block if open
                   // if (currentContentBlockIndex >= 0) {
                   //   const contentBlockStop = {
@@ -589,7 +586,7 @@ export class AnthropicTransformer implements Transformer {
                   }
                 }
 
-                if (choice?.delta?.content && !isClosed && !hasFinished) {
+                if (choice?.delta?.content && !isClosed && !hasStopReason) {
                   contentChunks++;
 
                   // Close any previous content block if open and it's not a text content block
@@ -612,7 +609,7 @@ export class AnthropicTransformer implements Transformer {
                     }
                   }
 
-                  if (!hasTextContentStarted && !hasFinished) {
+                  if (!hasTextContentStarted && !hasStopReason) {
                     hasTextContentStarted = true;
                     const textBlockIndex = assignContentBlockIndex();
                     const contentBlockStart = {
@@ -633,7 +630,7 @@ export class AnthropicTransformer implements Transformer {
                     currentContentBlockIndex = textBlockIndex;
                   }
 
-                  if (!isClosed && !hasFinished) {
+                  if (!isClosed && !hasStopReason) {
                     const anthropicChunk = {
                       type: "content_block_delta",
                       index: currentContentBlockIndex, // Use current content block index
@@ -655,7 +652,7 @@ export class AnthropicTransformer implements Transformer {
                 if (
                   choice?.delta?.annotations?.length &&
                   !isClosed &&
-                  !hasFinished
+                  !hasStopReason
                 ) {
                   // Close text content block if open
                   if (currentContentBlockIndex >= 0 && hasTextContentStarted) {
@@ -714,7 +711,7 @@ export class AnthropicTransformer implements Transformer {
                   });
                 }
 
-                if (choice?.delta?.tool_calls && !isClosed && !hasFinished) {
+                if (choice?.delta?.tool_calls && !isClosed && !hasStopReason) {
                   toolCallChunks++;
                   const processedInThisChunk = new Set<number>();
 
@@ -796,7 +793,7 @@ export class AnthropicTransformer implements Transformer {
                     if (
                       toolCall.function?.arguments &&
                       !isClosed &&
-                      !hasFinished
+                      !hasStopReason
                     ) {
                       const blockIndex =
                         toolCallIndexToContentBlockIndex.get(toolCallIndex);
@@ -855,7 +852,7 @@ export class AnthropicTransformer implements Transformer {
                   }
                 }
 
-                if (choice?.finish_reason && !isClosed && !hasFinished) {
+                if (choice?.finish_reason && !isClosed && !hasStopReason) {
                   if (contentChunks === 0 && toolCallChunks === 0) {
                     console.error(
                       "Warning: No content in the stream response!"
@@ -886,29 +883,28 @@ export class AnthropicTransformer implements Transformer {
                       content_filter: "stop_sequence",
                     };
 
-                    const anthropicStopReason =
+                    finalStopReason =
                       stopReasonMapping[choice.finish_reason] || "end_turn";
-
-                    stopReasonMessageDelta = {
-                      type: "message_delta",
-                      delta: {
-                        stop_reason: anthropicStopReason,
+                    if (!stopReasonMessageDelta) {
+                      stopReasonMessageDelta = {
+                        type: "message_delta",
+                        delta: {
+                          stop_reason: finalStopReason,
+                          stop_sequence: null,
+                        },
+                        usage: latestUsage,
+                      };
+                    } else {
+                      stopReasonMessageDelta.delta = {
+                        stop_reason: finalStopReason,
                         stop_sequence: null,
-                      },
-                      usage: {
-                        input_tokens:
-                          (chunk.usage?.prompt_tokens || 0) -
-                          (chunk.usage?.prompt_tokens_details?.cached_tokens ||
-                            0),
-                        output_tokens: chunk.usage?.completion_tokens || 0,
-                        cache_read_input_tokens:
-                          chunk.usage?.prompt_tokens_details?.cached_tokens ||
-                          0,
-                      },
-                    };
+                      };
+                      stopReasonMessageDelta.usage = latestUsage;
+                    }
                   }
 
-                  break;
+                  hasStopReason = true;
+                  continue;
                 }
               } catch (parseError: any) {
                 this.logger?.error(
