@@ -216,8 +216,11 @@ async function processRequestTransformers(
   if (bypass) {
     if (headers instanceof Headers) {
       headers.delete("content-length");
+      headers.delete("authorization");
     } else {
       delete headers["content-length"];
+      delete headers["authorization"];
+      delete headers["Authorization"];
     }
     config.headers = headers;
   }

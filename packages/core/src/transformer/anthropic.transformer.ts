@@ -505,6 +505,51 @@ export class AnthropicTransformer implements Transformer {
                   continue;
                 }
 
+                // Handle reasoning_content from DeepSeek and other OpenAI-compatible providers
+                const reasoningContent =
+                  choice?.delta?.reasoning_content ||
+                  choice?.delta?.reasoning ||
+                  choice?.delta?.reasoning_text;
+                if (
+                  reasoningContent &&
+                  typeof reasoningContent === "string" &&
+                  !isClosed &&
+                  !hasStopReason
+                ) {
+                  if (!isThinkingStarted) {
+                    const thinkingBlockIndex = assignContentBlockIndex();
+                    const contentBlockStart = {
+                      type: "content_block_start",
+                      index: thinkingBlockIndex,
+                      content_block: { type: "thinking", thinking: "" },
+                    };
+                    safeEnqueue(
+                      encoder.encode(
+                        `event: content_block_start\ndata: ${JSON.stringify(
+                          contentBlockStart
+                        )}\n\n`
+                      )
+                    );
+                    currentContentBlockIndex = thinkingBlockIndex;
+                    isThinkingStarted = true;
+                  }
+                  const thinkingChunk = {
+                    type: "content_block_delta",
+                    index: currentContentBlockIndex,
+                    delta: {
+                      type: "thinking_delta",
+                      thinking: reasoningContent,
+                    },
+                  };
+                  safeEnqueue(
+                    encoder.encode(
+                      `event: content_block_delta\ndata: ${JSON.stringify(
+                        thinkingChunk
+                      )}\n\n`
+                    )
+                  );
+                }
+
                 if (choice?.delta?.thinking && !isClosed && !hasStopReason) {
                   // Close any previous content block if open
                   // if (currentContentBlockIndex >= 0) {
